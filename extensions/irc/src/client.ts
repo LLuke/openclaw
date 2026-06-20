@@ -36,6 +36,13 @@ export type IrcClientOptions = {
   onNotice?: (text: string, target?: string) => void;
   onError?: (error: Error) => void;
   onLine?: (line: string) => void;
+  /**
+   * When true, skip nick fallback on 433/436 and fail immediately.
+   * Useful for probe connections that just need to verify the server is live:
+   * a 433 response means the server is up, so probes should bail fast rather
+   * than creating a long-lived fallback connection.
+   */
+  noNickFallback?: boolean;
 };
 
 export type IrcNickServOptions = {
@@ -54,6 +61,8 @@ export type IrcClient = {
   sendPrivmsg: (target: string, text: string) => void;
   quit: (reason?: string) => void;
   close: () => void;
+  /** Resolves when the underlying socket closes (normal or error). */
+  closed: Promise<void>;
 };
 
 function toError(err: unknown): Error {
@@ -132,6 +141,11 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
   let nickServRecoverAttempted = false;
   let fallbackNickAttempted = false;
 
+  let resolveClose: (() => void) | null = null;
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClose = resolve;
+  });
+
   const socket = options.tls
     ? tls.connect({
         host: options.host,
@@ -170,6 +184,12 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
   };
 
   const tryRecoverNickCollision = (): boolean => {
+    // When noNickFallback is set (e.g. probe mode), skip all recovery so the
+    // caller can detect 433 as "server is live" without creating extra connections.
+    if (options.noNickFallback) {
+      return false;
+    }
+
     const nickServEnabled = options.nickserv?.enabled !== false;
     const nickservPassword = sanitizeIrcOutboundText(options.nickserv?.password ?? "");
     if (nickServEnabled && !nickServRecoverAttempted && nickservPassword) {
@@ -410,6 +430,8 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
         fail(new Error("IRC connection closed before ready"));
       }
     }
+    resolveClose?.();
+    resolveClose = null;
   });
 
   if (options.abortSignal) {
@@ -435,5 +457,6 @@ export async function connectIrcClient(options: IrcClientOptions): Promise<IrcCl
     sendPrivmsg,
     quit,
     close,
+    closed: closedPromise,
   };
 }

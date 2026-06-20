@@ -8,6 +8,17 @@ import { makeIrcMessageId } from "./protocol.js";
 import { getIrcRuntime } from "./runtime.js";
 import type { CoreConfig, IrcInboundMessage } from "./types.js";
 
+/**
+ * Registry of currently active IRC monitor clients, keyed by account ID.
+ * Allows probeIrc to skip a redundant TCP connection when the main monitor
+ * socket is already open and healthy.
+ */
+const activeMonitorClients = new Map<string, IrcClient>();
+
+export function getActiveIrcMonitorClient(accountId: string): IrcClient | null {
+  return activeMonitorClients.get(accountId) ?? null;
+}
+
 export type IrcMonitorOptions = {
   accountId?: string;
   config?: CoreConfig;
@@ -58,6 +69,7 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
   });
 
   let client: IrcClient | null = null;
+  let lastError: Error | null = null;
 
   client = await connectIrcClient(
     buildIrcConnectOptions(account, {
@@ -74,6 +86,7 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
         }
       },
       onError: (error) => {
+        lastError = error;
         logger.error(`[${account.accountId}] IRC error: ${error.message}`);
       },
       onPrivmsg: async (event) => {
@@ -137,10 +150,28 @@ export async function monitorIrcProvider(opts: IrcMonitorOptions): Promise<{ sto
     `[${account.accountId}] connected to ${account.host}:${account.port}${account.tls ? " (tls)" : ""} as ${client.nick}`,
   );
 
+  // Register so probeIrc can short-circuit when the monitor is already connected.
+  activeMonitorClients.set(account.accountId, client);
+
+  // Keep this async function alive until the socket closes. Without this await,
+  // the function would return immediately after connecting and server-channels
+  // would treat the task as "completed", triggering spurious auto-restarts that
+  // hammer the IRC server with reconnection attempts using the same nick.
+  await client.closed;
+
+  activeMonitorClients.delete(account.accountId);
+
+  const stopped = client;
+  client = null;
+
+  if (lastError) {
+    throw lastError;
+  }
+
   return {
     stop: () => {
-      client?.quit("shutdown");
-      client = null;
+      // Connection is already closed; nothing to do.
+      stopped?.quit("shutdown");
     },
   };
 }
